@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 import re
 
@@ -36,6 +36,8 @@ class Change:
     right: int | None
     left_offset: int | None = None
     right_offset: int | None = None
+    left_end: int | None = None
+    right_end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -235,9 +237,12 @@ def _compare_tokens(
                     left_spans.append(Span(a[i1][1], a[i2 - 1][2], tag))
                 if j1 < j2:
                     right_spans.append(Span(b[j1][1], b[j2 - 1][2], tag))
+                left_start = a[i1][1] if i1 < len(a) else left.end
+                right_start = b[j1][1] if j1 < len(b) else right.end
                 changes.append(Change(tag, left_index, right_index,
-                                      a[i1][1] if i1 < i2 else None,
-                                      b[j1][1] if j1 < j2 else None))
+                                      left_start, right_start,
+                                      a[i2 - 1][2] if i1 < i2 else left_start,
+                                      b[j2 - 1][2] if j1 < j2 else right_start))
         previous_a, previous_b = current_a, current_b
 
 
@@ -258,14 +263,18 @@ def _compare_sentences(
         if tag == "equal":
             continue
         if tag == "insert":
+            anchor = left_sentences[i1].start if i1 < len(left_sentences) else left.end
             for sentence in right_sentences[j1:j2]:
                 right_spans.append(Span(sentence.start, sentence.end, "insert"))
-                changes.append(Change("insert", left_index, right_index, None, sentence.start))
+                changes.append(Change("insert", left_index, right_index,
+                                      anchor, sentence.start, anchor, sentence.end))
             continue
         if tag == "delete":
+            anchor = right_sentences[j1].start if j1 < len(right_sentences) else right.end
             for sentence in left_sentences[i1:i2]:
                 left_spans.append(Span(sentence.start, sentence.end, "delete"))
-                changes.append(Change("delete", left_index, right_index, sentence.start, None))
+                changes.append(Change("delete", left_index, right_index,
+                                      sentence.start, anchor, sentence.end, anchor))
             continue
         # A punctuation edit can join or split sentences. Compare the whole
         # changed run so words on either side can still match.
@@ -350,15 +359,32 @@ def compare(
                 if li is None:
                     block = right[ri]
                     right_spans.append(Span(block.start, block.end, "insert"))
-                    changes.append(Change("insert", None, ri, None, block.start))
+                    changes.append(Change("insert", None, ri, None, block.start, None, block.end))
                 elif ri is None:
                     block = left[li]
                     left_spans.append(Span(block.start, block.end, "delete"))
-                    changes.append(Change("delete", li, None, block.start, None))
+                    changes.append(Change("delete", li, None, block.start, None, block.end, None))
                 else:
                     _compare_sentences(left[li], right[ri], li, ri,
                                        ignore_whitespace, strict_markdown,
                                        left_spans, right_spans, changes)
+    # A whole-block insertion or deletion still needs a position on the empty
+    # side, so accepting either direction has an exact insertion point.
+    pair_positions = {pair: position for position, pair in enumerate(pairs)}
+    for change_index, change in enumerate(changes):
+        if change.left_offset is not None and change.right_offset is not None:
+            continue
+        row_index = pair_positions[(change.left, change.right)]
+        if change.left_offset is None:
+            previous = next((left[li].end for li, _ in reversed(pairs[:row_index]) if li is not None), None)
+            following = next((left[li].start for li, _ in pairs[row_index + 1:] if li is not None), None)
+            anchor = previous if previous is not None else following if following is not None else 0
+            changes[change_index] = replace(change, left_offset=anchor, left_end=anchor)
+        else:
+            previous = next((right[ri].end for _, ri in reversed(pairs[:row_index]) if ri is not None), None)
+            following = next((right[ri].start for _, ri in pairs[row_index + 1:] if ri is not None), None)
+            anchor = previous if previous is not None else following if following is not None else 0
+            changes[change_index] = replace(change, right_offset=anchor, right_end=anchor)
     return DiffResult(
         left, right, tuple(left_spans), tuple(right_spans), tuple(changes),
         tuple(alignments), tuple(pairs), len(WORD_RE.findall(left_text)), len(WORD_RE.findall(right_text)),

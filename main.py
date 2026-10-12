@@ -23,12 +23,16 @@ QLabel#sectionLabel { color: #8d8a99; font-weight: 700; font-size: 10px; letter-
 QLabel#statValue { color: #efeef4; font-weight: 700; }
 QLabel#badge { color: #b9a6f4; background: #282334; border: 1px solid #44385f; border-radius: 9px; padding: 5px 9px; }
 QLabel#paneHeading { color: #a9a6b4; background: #1e1e24; border-bottom: 1px solid #2d2d35; padding: 9px 14px; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+QLabel#paneHeading[isFinal="true"] { color: #f0edf5; background: #35313f; border-bottom: 1px solid #6e5a9f; }
 QPlainTextEdit { background: #141417; color: #e6e2e9; border: 0; selection-background-color: #8a70d6; selection-color: #ffffff; padding: 10px 7px 10px 0; font-family: "Lora", "Noto Serif", "Georgia", serif; font-size: 14px; }
 QPushButton, QToolButton { background: #292830; color: #e2e0e8; border: 1px solid #393841; border-radius: 6px; padding: 6px 10px; }
 QPushButton:hover, QToolButton:hover { background: #35313f; border-color: #6e5a9f; }
 QPushButton:pressed, QToolButton:pressed, QToolButton:checked { background: #483a64; border-color: #8a70d6; color: #ffffff; }
 QPushButton#primaryButton { background: #51406f; border-color: #715a9c; color: #ffffff; font-weight: 700; text-align: left; }
 QPushButton#fileButton { text-align: left; background: #222127; }
+QComboBox { background: #292830; color: #e2e0e8; border: 1px solid #393841; border-radius: 6px; padding: 6px 10px; }
+QComboBox:hover { border-color: #6e5a9f; }
+QComboBox QAbstractItemView { background: #292830; color: #e2e0e8; selection-background-color: #483a64; }
 QCheckBox { spacing: 6px; color: #bcb9c6; }
 QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px; background: #292830; border: 1px solid #615b6e; }
 QCheckBox::indicator:checked { background: #8a70d6; border-color: #a58de6; }

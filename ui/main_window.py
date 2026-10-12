@@ -7,14 +7,21 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, QRect, QRunnable, QSettings, QSignalBlocker, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QShortcut, QKeySequence
+from PySide6.QtGui import QColor, QCursor, QPainter, QPainterPath, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollBar, QSizePolicy,
     QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from prose_diff import Block, DiffResult, Span, compare
+
+
+DEFAULT_DOCUMENT_FONT_SIZE = 14
+MIN_DOCUMENT_FONT_SIZE = 8
+MAX_DOCUMENT_FONT_SIZE = 32
+SIDEBAR_EDGE_WIDTH = 12
+SIDEBAR_WIDTH = 220
 
 
 def _format(kind: str) -> QTextCharFormat:
@@ -102,6 +109,52 @@ class ProseEditor(QPlainTextEdit):
         self.setPlaceholderText("Open a Markdown file, or start typing…")
         self.diff_lines: dict[int, str] = {}
         self.highlighter = DiffHighlighter(self.document())
+        self.selected_diff: tuple[int, int] | None = None
+
+    def set_selected_diff(self, start: int | None, end: int | None):
+        self.selected_diff = (start, end) if start is not None and end is not None else None
+        self.viewport().update()
+
+    def paintEvent(self, event):  # noqa: N802
+        super().paintEvent(event)
+        if self.selected_diff is None:
+            return
+        start, end = self.selected_diff
+        painter = QPainter(self.viewport())
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if start == end:
+            caret = QTextCursor(self.document())
+            caret.setPosition(start)
+            rect = self.cursorRect(caret)
+            painter.drawRect(QRect(rect.x() - 2, rect.y(), 7, rect.height() - 1))
+            return
+        lines: dict[int, list[int]] = {}
+        cursor = QTextCursor(self.document())
+        for position in range(start, end):
+            cursor.setPosition(position)
+            rect = self.cursorRect(cursor)
+            if rect.bottom() < event.rect().top() or rect.top() > event.rect().bottom():
+                continue
+            cursor.setPosition(position + 1)
+            following = self.cursorRect(cursor)
+            width = following.x() - rect.x() if following.y() == rect.y() else 7
+            right = rect.x() + max(7, width)
+            bounds = lines.setdefault(rect.y(), [rect.x(), right, rect.height()])
+            bounds[0] = min(bounds[0], rect.x())
+            bounds[1] = max(bounds[1], right)
+        for y, (left, right, height) in lines.items():
+            painter.drawRect(QRect(left - 2, y, right - left + 3, height - 1))
+
+    def set_document_font_size(self, size: int):
+        font = self.font()
+        font.setPixelSize(size)
+        self.setFont(font)
+        self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
+        self._update_gutter_width()
+        rect = self.contentsRect()
+        self.line_area.setGeometry(QRect(rect.left(), rect.top(), self.gutter_width(), rect.height()))
+        self.line_area.update()
 
     def set_diff_spans(self, spans: tuple[Span, ...]):
         self.highlighter.set_spans(spans)
@@ -140,6 +193,7 @@ class Connector(QWidget):
         super().__init__()
         self.left, self.right = left, right
         self.result: DiffResult | None = None
+        self.result_revision = -1
         self.setFixedWidth(28)
 
     def paintEvent(self, event):  # noqa: N802
@@ -186,8 +240,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SideXSide")
         self.resize(1450, 900)
         self.settings = QSettings("SideXSide", "SideXSide")
+        try:
+            saved_size = int(self.settings.value("document_font_size", DEFAULT_DOCUMENT_FONT_SIZE))
+        except (TypeError, ValueError):
+            saved_size = DEFAULT_DOCUMENT_FONT_SIZE
+        self.document_font_size = max(MIN_DOCUMENT_FONT_SIZE, min(MAX_DOCUMENT_FONT_SIZE, saved_size))
         self.paths: list[Path | None] = [None, None]
         self.dirty = [False, False]
+        self.final_side = 1
+        self.sidebar_pinned = False
+        self._sidebar_width = SIDEBAR_WIDTH
         try:
             self.recent: list[list[str]] = json.loads(self.settings.value("recent", "[]"))
         except (TypeError, ValueError):
@@ -195,9 +257,15 @@ class MainWindow(QMainWindow):
         self.result: DiffResult | None = None
         self.revision = 0
         self.current_change = -1
+        self._action_undo_sides: list[int] = []
+        self._action_redo_sides: list[int] = []
+        self._last_edited_side: int | None = None
+        self._applying_change = False
+        self._running_undo_redo = False
         self._syncing = False
         self._running = False
         self._opening_pair = False
+        self._updating_unified = False
         self._reload_pending: set[str] = set()
         self._task: DiffTask | None = None
         self.pool = QThreadPool.globalInstance()
@@ -209,6 +277,10 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(300)
         self.timer.timeout.connect(self._start_diff)
         self._build_ui()
+        self.sidebar_hover_timer = QTimer(self)
+        self.sidebar_hover_timer.setInterval(100)
+        self.sidebar_hover_timer.timeout.connect(self._update_sidebar_hover)
+        self.sidebar_hover_timer.start()
         self._refresh_recent()
         self._schedule_diff()
 
@@ -264,7 +336,7 @@ class MainWindow(QMainWindow):
         file_row.setSpacing(8)
         sidebar_button = QToolButton()
         sidebar_button.setText("☰")
-        sidebar_button.setToolTip("Show or hide sidebar (Ctrl+B)")
+        sidebar_button.setToolTip("Keep sidebar open or hide it (Ctrl+B)")
         sidebar_button.clicked.connect(self.toggle_sidebar)
         file_row.addWidget(sidebar_button)
         self.file_buttons = []
@@ -276,13 +348,22 @@ class MainWindow(QMainWindow):
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             file_row.addWidget(button, 1)
             self.file_buttons.append(button)
-        self.save_buttons = []
-        for side, text in enumerate(("Save Original", "Save Revised")):
-            button = QPushButton(text)
-            button.clicked.connect(lambda _=False, s=side: self.save_file(s))
-            file_row.addWidget(button)
-            self.save_buttons.append(button)
         toolbar_layout.addLayout(file_row)
+
+        final_row = QHBoxLayout()
+        final_row.setSpacing(8)
+        final_row.addWidget(QLabel("Final file:"))
+        self.final_file_combo = QComboBox()
+        self.final_file_combo.addItem("Original (Before)", 0)
+        self.final_file_combo.addItem("Revised (After)", 1)
+        self.final_file_combo.setCurrentIndex(self.final_side)
+        self.final_file_combo.setToolTip("Choose the file you can edit and save")
+        self.final_file_combo.currentIndexChanged.connect(self._set_final_side)
+        final_row.addWidget(self.final_file_combo, 1)
+        self.save_button = QPushButton("Save Final")
+        self.save_button.clicked.connect(lambda: self.save_file(self.final_side))
+        final_row.addWidget(self.save_button)
+        toolbar_layout.addLayout(final_row)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
@@ -303,11 +384,19 @@ class MainWindow(QMainWindow):
         self.strict_box = QCheckBox("Strict Markdown")
         self.strict_box.toggled.connect(self._schedule_diff)
         controls.addWidget(self.strict_box)
-        self.wrap_box = QCheckBox("Word wrap")
-        self.wrap_box.setChecked(True)
-        self.wrap_box.toggled.connect(self._set_wrap)
-        controls.addWidget(self.wrap_box)
         controls.addStretch()
+        self.accept_button = QPushButton()
+        self.accept_button.clicked.connect(lambda: self.apply_change(self.final_side))
+        controls.addWidget(self.accept_button)
+        self.use_all_button = QPushButton("Use All")
+        self.use_all_button.setToolTip("Apply all remaining differences to the final document")
+        self.use_all_button.setEnabled(False)
+        self.use_all_button.clicked.connect(self.apply_all_changes)
+        controls.addWidget(self.use_all_button)
+        self.discard_button = QPushButton("Discard Change")
+        self.discard_button.setToolTip("Make the comparison document match the final document at this difference")
+        self.discard_button.clicked.connect(lambda: self.apply_change(1 - self.final_side))
+        controls.addWidget(self.discard_button)
         previous = QPushButton("← Previous")
         previous.clicked.connect(lambda: self.navigate(-1))
         controls.addWidget(previous)
@@ -324,6 +413,7 @@ class MainWindow(QMainWindow):
         self.panes = QSplitter(Qt.Orientation.Horizontal)
         self.panes.setChildrenCollapsible(False)
         self.editors: list[ProseEditor] = []
+        self.pane_headings: list[QLabel] = []
         wrappers = []
         for side, title_text in enumerate(("ORIGINAL  /  BEFORE", "REVISED  /  AFTER")):
             wrapper = QWidget()
@@ -335,10 +425,13 @@ class MainWindow(QMainWindow):
             layout.addWidget(heading)
             editor = ProseEditor()
             editor.textChanged.connect(lambda s=side: self._text_changed(s))
+            editor.cursorPositionChanged.connect(lambda s=side: self._cursor_at_change(s))
             editor.verticalScrollBar().valueChanged.connect(lambda _value, s=side: self._sync_scroll(s))
             layout.addWidget(editor)
             self.editors.append(editor)
+            self.pane_headings.append(heading)
             wrappers.append(wrapper)
+        self._update_final_side_ui()
         self.connector = Connector(*self.editors)
         self.panes.addWidget(wrappers[0])
         self.panes.addWidget(self.connector)
@@ -348,26 +441,71 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.panes)
         self.unified = ProseEditor()
         self.unified.setReadOnly(True)
+        self.unified.cursorPositionChanged.connect(self._unified_cursor_at_change)
+        for editor in (*self.editors, self.unified):
+            editor.set_document_font_size(self.document_font_size)
         self.unified_positions: dict[tuple[int | None, int | None], int] = {}
         self.unified_source_map: list[tuple[int, int, int, int]] = []
         self.stack.addWidget(self.unified)
         content_layout.addWidget(self.stack, 1)
         root.addWidget(content)
         root.setStretchFactor(1, 1)
-        root.setSizes([220, 1230])
+        root.setSizes([0, 1230])
 
         QShortcut(QKeySequence("F7"), self, activated=lambda: self.navigate(1))
         QShortcut(QKeySequence("Shift+F7"), self, activated=lambda: self.navigate(-1))
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo_change)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo_change)
+        QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo_change)
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self.toggle_sidebar)
-        self.statusBar().showMessage("Ready · all comparisons run locally")
+        for sequence in ("Ctrl++", "Ctrl+=", "Ctrl+Shift++", "Ctrl+Shift+="):
+            QShortcut(QKeySequence(sequence), self, activated=lambda: self.change_document_font_size(1))
+        QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.change_document_font_size(-1))
+        self.statusBar()
+
+    def change_document_font_size(self, step: int):
+        size = max(MIN_DOCUMENT_FONT_SIZE, min(MAX_DOCUMENT_FONT_SIZE, self.document_font_size + step))
+        if size == self.document_font_size:
+            return
+        self.document_font_size = size
+        for editor in (*self.editors, self.unified):
+            editor.set_document_font_size(size)
+        self.connector.update()
+        self.settings.setValue("document_font_size", size)
 
     def toggle_sidebar(self):
+        visible = self.root_splitter.sizes()[0] > 0
+        self.sidebar_pinned = not visible
+        self._set_sidebar_visible(not visible)
+
+    def _set_sidebar_visible(self, visible: bool):
         sizes = self.root_splitter.sizes()
+        currently_visible = sizes[0] > 0
+        if visible == currently_visible:
+            return
         total = sum(sizes)
-        if sizes[0] > 0:
-            self.root_splitter.setSizes([0, total])
+        if visible:
+            self.root_splitter.setSizes([self._sidebar_width, max(0, total - self._sidebar_width)])
         else:
-            self.root_splitter.setSizes([220, max(0, total - 220)])
+            self._sidebar_width = sizes[0]
+            self.root_splitter.setSizes([0, total])
+
+    def _update_sidebar_hover(self):
+        if self.isVisible() and not self.sidebar_pinned:
+            self._update_sidebar_for_position(self.mapFromGlobal(QCursor.pos()))
+
+    def _update_sidebar_for_position(self, position):
+        if self.sidebar_pinned:
+            return
+        area = self.root_splitter.geometry()
+        if not area.contains(position):
+            self._set_sidebar_visible(False)
+            return
+        x = position.x() - area.x()
+        if x <= SIDEBAR_EDGE_WIDTH:
+            self._set_sidebar_visible(True)
+        elif x > self.root_splitter.sizes()[0] + SIDEBAR_EDGE_WIDTH:
+            self._set_sidebar_visible(False)
 
     @staticmethod
     def _section_label(text: str) -> QLabel:
@@ -382,19 +520,41 @@ class MainWindow(QMainWindow):
         if inline and self.result:
             self._update_unified(self.result)
 
-    def _set_wrap(self, enabled: bool):
-        mode = QPlainTextEdit.LineWrapMode.WidgetWidth if enabled else QPlainTextEdit.LineWrapMode.NoWrap
-        for editor in (*self.editors, self.unified):
-            editor.setLineWrapMode(mode)
-        self.connector.update()
+    def _set_final_side(self, index: int):
+        side = self.final_file_combo.itemData(index)
+        if side not in (0, 1):
+            return
+        self.final_side = side
+        self._update_final_side_ui()
+
+    def _update_final_side_ui(self):
+        for side, editor in enumerate(self.editors):
+            editor.setReadOnly(side != self.final_side)
+            title = "ORIGINAL  /  BEFORE" if side == 0 else "REVISED  /  AFTER"
+            role = "FINAL · EDITABLE" if side == self.final_side else "READ ONLY"
+            heading = self.pane_headings[side]
+            heading.setText(f"{title}  ·  {role}")
+            heading.setProperty("isFinal", side == self.final_side)
+            heading.style().unpolish(heading)
+            heading.style().polish(heading)
+            heading.update()
+        self.save_button.setToolTip(f"Save the selected final file ({'Original' if self.final_side == 0 else 'Revised'})")
+        self.accept_button.setText("→ Use Comparison" if self.final_side == 1 else "← Use Comparison")
+        self.accept_button.setToolTip("Make the final document match the comparison document at this difference")
 
     def _text_changed(self, side: int):
+        self._last_edited_side = side
+        if not self._applying_change and not self._running_undo_redo:
+            self._action_undo_sides.clear()
+            self._action_redo_sides.clear()
         self.dirty[side] = True
         self._update_file_button(side)
         self._schedule_diff()
 
     def _schedule_diff(self, *_):
         self.revision += 1
+        if hasattr(self, "accept_button"):
+            self._clear_change_selection()
         self.timer.start()
 
     def _start_diff(self):
@@ -416,6 +576,7 @@ class MainWindow(QMainWindow):
         state = [(QTextCursor(editor.textCursor()), self._scroll_fraction(editor.verticalScrollBar()))
                  for editor in self.editors]
         self.result = result
+        self.result_revision = revision
         with QSignalBlocker(self.editors[0]), QSignalBlocker(self.editors[1]):
             self.editors[0].set_diff_spans(result.left_spans)
             self.editors[1].set_diff_spans(result.right_spans)
@@ -429,11 +590,16 @@ class MainWindow(QMainWindow):
         net = result.right_words - result.left_words
         self.stats["net"].setText(f"{net:+,}")
         self.stats["edits"].setText(f"{result.edit_count:,}")
-        self.current_change = min(self.current_change, result.edit_count - 1)
-        self._update_badge()
+        self._select_change(-1)
         if self.stack.currentIndex() == 1:
             self._update_unified(result)
-        self.statusBar().showMessage(f"{result.edit_count} differences · live comparison")
+        if self.stack.currentIndex() == 1 and self.unified.hasFocus():
+            self._unified_cursor_at_change()
+        else:
+            for side, editor in enumerate(self.editors):
+                if editor.hasFocus():
+                    self._cursor_at_change(side)
+                    break
 
     @staticmethod
     def _scroll_fraction(bar: QScrollBar) -> float:
@@ -458,7 +624,162 @@ class MainWindow(QMainWindow):
 
     def _update_badge(self):
         count = self.result.edit_count if self.result else 0
-        self.diff_badge.setText(f"Diff {self.current_change + 1 if count else 0} of {count}")
+        self.diff_badge.setText(f"Diff {self.current_change + 1 if self.current_change >= 0 else 0} of {count}")
+
+    def _clear_change_selection(self):
+        self.current_change = -1
+        for editor in self.editors:
+            editor.set_selected_diff(None, None)
+        self.accept_button.setEnabled(False)
+        self.discard_button.setEnabled(False)
+        self.use_all_button.setEnabled(
+            self.result is not None and self.result_revision == self.revision and self.result.edit_count > 0
+        )
+        self._update_badge()
+
+    def _select_change(self, index: int):
+        if self.result is None or not 0 <= index < self.result.edit_count:
+            self._clear_change_selection()
+            return
+        self.current_change = index
+        change = self.result.changes[index]
+        self.editors[0].set_selected_diff(change.left_offset, change.left_end)
+        self.editors[1].set_selected_diff(change.right_offset, change.right_end)
+        self.accept_button.setEnabled(True)
+        self.discard_button.setEnabled(True)
+        self._update_badge()
+
+    def _cursor_at_change(self, side: int):
+        if self.result is None or self.result_revision != self.revision:
+            return
+        position = self.editors[side].textCursor().position()
+        self._select_change_at_position(side, position)
+
+    def _select_change_at_position(self, side: int, position: int):
+        for index, change in enumerate(self.result.changes):
+            start, end = ((change.left_offset, change.left_end) if side == 0
+                          else (change.right_offset, change.right_end))
+            if start is not None and (start <= position < end or start == end == position):
+                self._select_change(index)
+                return
+        self._select_change(-1)
+
+    def _unified_cursor_at_change(self):
+        if self._updating_unified or self.result is None or self.result_revision != self.revision:
+            return
+        position = self.unified.textCursor().position()
+        for side, start, end, target in self.unified_source_map:
+            if target <= position < target + end - start:
+                self._select_change_at_position(side, start + position - target)
+                return
+        self._select_change(-1)
+
+    def apply_change(self, target_side: int):
+        if (self.result is None or self.result_revision != self.revision
+                or not 0 <= self.current_change < self.result.edit_count):
+            return
+        change = self.result.changes[self.current_change]
+        if target_side == 0:
+            start, end = change.left_offset, change.left_end
+            source_start, source_end = change.right_offset, change.right_end
+        else:
+            start, end = change.right_offset, change.right_end
+            source_start, source_end = change.left_offset, change.left_end
+        if None in (start, end, source_start, source_end):
+            return
+        replacement = self.editors[1 - target_side].toPlainText()[source_start:source_end]
+        cursor = QTextCursor(self.editors[target_side].document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        self._applying_change = True
+        try:
+            cursor.beginEditBlock()
+            cursor.insertText(replacement)
+            cursor.endEditBlock()
+        finally:
+            self._applying_change = False
+        self._action_undo_sides.append(target_side)
+        self._action_redo_sides.clear()
+        self.statusBar().showMessage("Difference applied to final document" if target_side == self.final_side
+                                     else "Difference discarded in comparison document")
+
+    def apply_all_changes(self):
+        if self.result is None or self.result_revision != self.revision or not self.result.changes:
+            return
+        revision = self.revision
+        answer = QMessageBox.question(
+            self, "Use all changes", "Are you sure?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if (answer != QMessageBox.StandardButton.Yes or self.revision != revision
+                or self.result_revision != revision):
+            return
+
+        target_side = self.final_side
+        source = self.editors[1 - target_side].toPlainText()
+        edits = []
+        for index, change in enumerate(self.result.changes):
+            if target_side == 0:
+                start, end = change.left_offset, change.left_end
+                source_start, source_end = change.right_offset, change.right_end
+            else:
+                start, end = change.right_offset, change.right_end
+                source_start, source_end = change.left_offset, change.left_end
+            if None in (start, end, source_start, source_end):
+                return
+            edits.append((start, index, end, source[source_start:source_end]))
+
+        cursor = QTextCursor(self.editors[target_side].document())
+        self._applying_change = True
+        try:
+            cursor.beginEditBlock()
+            for start, _index, end, replacement in sorted(edits, reverse=True):
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                cursor.insertText(replacement)
+            cursor.endEditBlock()
+        finally:
+            self._applying_change = False
+        self._action_undo_sides.append(target_side)
+        self._action_redo_sides.clear()
+        self.statusBar().showMessage("All remaining differences applied to final document")
+
+    def _history_editor(self) -> ProseEditor | None:
+        for editor in self.editors:
+            if editor.hasFocus() and not editor.isReadOnly():
+                return editor
+        if self._last_edited_side is not None:
+            return self.editors[self._last_edited_side]
+        return None
+
+    def undo_change(self):
+        action_side = self._action_undo_sides[-1] if self._action_undo_sides else None
+        editor = self.editors[action_side] if action_side is not None else self._history_editor()
+        if editor is None or not editor.document().isUndoAvailable():
+            return
+        self._running_undo_redo = True
+        try:
+            editor.undo()
+        finally:
+            self._running_undo_redo = False
+        if action_side is not None:
+            self._action_undo_sides.pop()
+            self._action_redo_sides.append(action_side)
+
+    def redo_change(self):
+        action_side = self._action_redo_sides[-1] if self._action_redo_sides else None
+        editor = self.editors[action_side] if action_side is not None else self._history_editor()
+        if editor is None or not editor.document().isRedoAvailable():
+            return
+        self._running_undo_redo = True
+        try:
+            editor.redo()
+        finally:
+            self._running_undo_redo = False
+        if action_side is not None:
+            self._action_redo_sides.pop()
+            self._action_undo_sides.append(action_side)
 
     def navigate(self, direction: int):
         if not self.result or not self.result.changes:
@@ -467,8 +788,9 @@ class MainWindow(QMainWindow):
             self.current_change = 0 if direction > 0 else self.result.edit_count - 1
         else:
             self.current_change = (self.current_change + direction) % self.result.edit_count
-        change = self.result.changes[self.current_change]
-        self._update_badge()
+        index = self.current_change
+        change = self.result.changes[index]
+        self._select_change(index)
         if self.stack.currentIndex() == 1:
             position = self.unified_positions.get((change.left, change.right), 0)
             source_side = 1 if change.kind == "insert" else 0
@@ -489,6 +811,7 @@ class MainWindow(QMainWindow):
         editor.setTextCursor(cursor)
         editor.centerCursor()
         editor.setFocus()
+        self._select_change(index)
 
     def _update_unified(self, result: DiffResult):
         chunks: list[str] = []
@@ -546,6 +869,7 @@ class MainWindow(QMainWindow):
                 add(block, "+ " if changed(block, 1) else "  ", 1, True)
         cursor = QTextCursor(self.unified.textCursor())
         fraction = self._scroll_fraction(self.unified.verticalScrollBar())
+        self._updating_unified = True
         self.unified.setPlainText("".join(chunks))
         self.unified.highlighter.set_spans(tuple(spans))
         cursor.setPosition(min(cursor.position(), len(self.unified.toPlainText())))
@@ -553,6 +877,7 @@ class MainWindow(QMainWindow):
         self._set_scroll_fraction(self.unified.verticalScrollBar(), fraction)
         self.unified_positions = positions
         self.unified_source_map = source_map
+        self._updating_unified = False
 
     def choose_file(self, side: int):
         initial = str(self.paths[side].parent) if self.paths[side] else str(Path.home())
@@ -591,6 +916,8 @@ class MainWindow(QMainWindow):
         self._remember_pair()
 
     def _replace_editor_text(self, side: int, text: str):
+        self._action_undo_sides.clear()
+        self._action_redo_sides.clear()
         editor = self.editors[side]
         cursor_position = editor.textCursor().position()
         fraction = self._scroll_fraction(editor.verticalScrollBar())
@@ -654,6 +981,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Reloaded {path.name} from disk")
 
     def save_file(self, side: int) -> bool:
+        if side != self.final_side:
+            return False
         path = self.paths[side]
         if path is None:
             filename, _ = QFileDialog.getSaveFileName(self, "Save Markdown document", str(Path.home() / "untitled.md"),
@@ -699,6 +1028,7 @@ class MainWindow(QMainWindow):
         self.paths = [None, None]
         for side in range(2):
             self._replace_editor_text(side, "")
+        self.final_file_combo.setCurrentIndex(1)
         self.current_change = -1
         self.setWindowTitle("SideXSide")
 
@@ -707,6 +1037,7 @@ class MainWindow(QMainWindow):
         label = "Original (Before)" if side == 0 else "Revised (After)"
         self.file_buttons[side].setText(f"{label}  ·  {name}{'  ●' if self.dirty[side] else ''}")
         self.file_buttons[side].setToolTip(str(self.paths[side]) if self.paths[side] else label)
+        self.final_file_combo.setItemText(side, f"{label} · {name}")
 
     def _remember_pair(self):
         if not all(self.paths):
