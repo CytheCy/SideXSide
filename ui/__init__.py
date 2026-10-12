@@ -1,0 +1,1 @@
+"""SideXSide Qt widgets."""
