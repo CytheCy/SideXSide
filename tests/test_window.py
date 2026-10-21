@@ -53,6 +53,7 @@ class WindowTests(unittest.TestCase):
 
     def test_live_edit_save_and_external_reload(self):
         self.window.sidebar_hover_timer.stop()
+        self.window.final_file_combo.setCurrentIndex(1)
         with tempfile.TemporaryDirectory() as directory:
             original = Path(directory, "original.md")
             revised = Path(directory, "revised.md")
@@ -108,7 +109,13 @@ class WindowTests(unittest.TestCase):
         self.window.toggle_sidebar()
         self.assertEqual(self.window.root_splitter.sizes()[0], 0)
 
+    def test_original_is_the_initial_final_file(self):
+        self.assertEqual(self.window.final_file_combo.currentData(), 0)
+        self.assertFalse(self.window.editors[0].isReadOnly())
+        self.assertTrue(self.window.editors[1].isReadOnly())
+
     def test_only_selected_final_file_can_be_edited_or_saved(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         with tempfile.TemporaryDirectory() as directory:
             original = Path(directory, "original.md")
             revised = Path(directory, "revised.md")
@@ -143,9 +150,9 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(revised.read_text(encoding="utf-8"), "After")
 
             self.window.new_session()
-            self.assertEqual(self.window.final_file_combo.currentData(), 1)
-            self.assertTrue(self.window.editors[0].isReadOnly())
-            self.assertFalse(self.window.editors[1].isReadOnly())
+            self.assertEqual(self.window.final_file_combo.currentData(), 0)
+            self.assertFalse(self.window.editors[0].isReadOnly())
+            self.assertTrue(self.window.editors[1].isReadOnly())
 
     def test_navigation_selects_each_word_change(self):
         self.window.editors[0].setPlainText("The blue door held the old key.")
@@ -162,6 +169,7 @@ class WindowTests(unittest.TestCase):
                          self.window.result.changes[0].left_offset)
 
     def test_navigation_boxes_and_actions_follow_selected_word(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         left = "The blue door held the old key."
         right = "The green door held the new key."
         self.window.editors[0].setPlainText(left)
@@ -197,6 +205,7 @@ class WindowTests(unittest.TestCase):
         self.assertIsNone(self.window.editors[1].selected_diff)
 
     def test_actions_handle_text_present_on_only_one_side(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         self.window.editors[0].setPlainText("alpha")
         self.window.editors[1].setPlainText("alpha beta")
         self.wait_for_diff()
@@ -230,6 +239,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.window.result.edit_count, 0)
 
     def test_use_all_confirms_and_applies_remaining_changes_as_one_edit(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         comparison = self.window.editors[0]
         final = self.window.editors[1]
         comparison.setPlainText("The blue door held the old key.")
@@ -275,6 +285,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.window.result.edit_count, 2)
 
     def test_unified_cursor_selects_matching_boxes(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         self.window.editors[0].setPlainText("A blue door.")
         self.window.editors[1].setPlainText("A green door.")
         self.wait_for_diff()
@@ -288,6 +299,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.window.editors[1].toPlainText(), "A blue door.")
 
     def test_ctrl_z_undoes_use_comparison_as_one_edit(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         self.window.editors[0].setPlainText("A blue door.")
         final = self.window.editors[1]
         final.setPlainText("A green door.")
@@ -308,6 +320,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(final.toPlainText(), "A blue door. Open")
 
     def test_ctrl_z_undoes_discard_in_read_only_comparison(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         comparison = self.window.editors[0]
         comparison.setPlainText("A blue door.")
         self.window.editors[1].setPlainText("A green door.")
@@ -323,6 +336,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(comparison.toPlainText(), "A green door.")
 
     def test_ctrl_z_still_undoes_ordinary_typing(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         final = self.window.editors[1]
         final.setFocus()
         QTest.keyClicks(final, "draft")
@@ -331,6 +345,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(final.toPlainText(), "")
 
     def test_ctrl_z_reverses_button_actions_across_both_documents(self):
+        self.window.final_file_combo.setCurrentIndex(1)
         self.window.editors[0].setPlainText("The blue door held the old key.")
         self.window.editors[1].setPlainText("The green door held the new key.")
         self.wait_for_diff()

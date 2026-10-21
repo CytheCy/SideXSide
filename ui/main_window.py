@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
 )
 
 from prose_diff import Block, DiffResult, Span, compare
+from ai_revision import generate_revision
+from ui.prompt_dialog import PromptDialog, PromptRun
 
 
 DEFAULT_DOCUMENT_FONT_SIZE = 14
@@ -234,6 +236,23 @@ class DiffTask(QRunnable):
         self.signals.finished.emit(self.revision, result)
 
 
+class RevisionSignals(QObject):
+    finished = Signal(object, object)
+
+
+class RevisionTask(QRunnable):
+    def __init__(self, provider: str, model: str, key_path: str, prompt: str, original: str):
+        super().__init__()
+        self.args = (provider, model, key_path, prompt, original)
+        self.signals = RevisionSignals()
+
+    def run(self):
+        try:
+            self.signals.finished.emit(generate_revision(*self.args), None)
+        except Exception as exc:  # Keep background errors in the GUI thread.
+            self.signals.finished.emit(None, str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -247,7 +266,7 @@ class MainWindow(QMainWindow):
         self.document_font_size = max(MIN_DOCUMENT_FONT_SIZE, min(MAX_DOCUMENT_FONT_SIZE, saved_size))
         self.paths: list[Path | None] = [None, None]
         self.dirty = [False, False]
-        self.final_side = 1
+        self.final_side = 0
         self.sidebar_pinned = False
         self._sidebar_width = SIDEBAR_WIDTH
         try:
@@ -268,6 +287,12 @@ class MainWindow(QMainWindow):
         self._updating_unified = False
         self._reload_pending: set[str] = set()
         self._task: DiffTask | None = None
+        self._revision_task: RevisionTask | None = None
+        self._revision_jobs: list[PromptRun] = []
+        self._revision_context: tuple[str, str, str, Path, str] | None = None
+        self._revision_total = 0
+        self._revision_saved = 0
+        self._revision_issues: list[str] = []
         self.pool = QThreadPool.globalInstance()
         self.watcher = QFileSystemWatcher(self)
         self.watcher.fileChanged.connect(self._file_changed)
@@ -303,6 +328,12 @@ class MainWindow(QMainWindow):
         new_button.setObjectName("primaryButton")
         new_button.clicked.connect(self.new_session)
         side_layout.addWidget(new_button)
+        self.apply_prompt_button = QPushButton("✦  Apply Prompt")
+        self.apply_prompt_button.setObjectName("primaryButton")
+        self.apply_prompt_button.setEnabled(False)
+        self.apply_prompt_button.setToolTip("Load an original document to apply a saved prompt")
+        self.apply_prompt_button.clicked.connect(self.open_prompt_dialog)
+        side_layout.addWidget(self.apply_prompt_button)
         side_layout.addWidget(self._section_label("RECENT PAIRS"))
         self.recent_list = QListWidget()
         self.recent_list.itemActivated.connect(self._open_recent)
@@ -886,8 +917,101 @@ class MainWindow(QMainWindow):
         if filename:
             self.load_file(side, Path(filename))
 
-    def load_file(self, side: int, path: Path):
-        if self.dirty[side] and not self._confirm_discard(side):
+    def open_prompt_dialog(self):
+        if self.paths[0] is None or self._revision_context is not None:
+            return
+        dialog = PromptDialog(self.settings, self, original_path=self.paths[0], revised_path=self.paths[1])
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        provider, model, key_path, jobs = dialog.choices()
+        if not jobs:
+            return
+        original_path = self.paths[0]
+        original_text = self.editors[0].toPlainText()
+        self._revision_context = (provider, model, key_path, original_path, original_text)
+        self._revision_jobs = list(jobs)
+        self._revision_total = len(jobs)
+        self._revision_saved = 0
+        self._revision_issues = []
+        self.apply_prompt_button.setEnabled(False)
+        self.apply_prompt_button.setText("✦  Generating…")
+        self._start_next_revision()
+
+    def _start_next_revision(self):
+        if not self._revision_jobs:
+            self._complete_revisions()
+            return
+        provider, model, key_path, _, original_text = self._revision_context
+        job = self._revision_jobs.pop(0)
+        number = self._revision_total - len(self._revision_jobs)
+        self.statusBar().showMessage(f"Applying prompt {number} of {self._revision_total}: {job.name}…")
+        task = RevisionTask(provider, model, key_path, job.text, original_text)
+        task.signals.finished.connect(lambda revised, error: self._finish_revision(job, revised, error))
+        self._revision_task = task
+        self.pool.start(task)
+
+    def _finish_revision(self, job: PromptRun, revised: str | None, error: str | None):
+        self._revision_task = None
+        if self._revision_context is None:
+            return
+        _, _, _, original_path, original_text = self._revision_context
+        if self.paths[0] != original_path or self.editors[0].toPlainText() != original_text:
+            self._revision_issues.append("The Original document changed during generation. Remaining prompts were skipped.")
+            self._revision_jobs.clear()
+        elif error:
+            self._revision_issues.append(f"{job.name}: {error}")
+        else:
+            issue = self._save_revision(job, revised)
+            if issue:
+                self._revision_issues.append(f"{job.name}: {issue}")
+            else:
+                self._revision_saved += 1
+        self._start_next_revision()
+
+    def _complete_revisions(self):
+        self._revision_context = None
+        self._revision_task = None
+        self.apply_prompt_button.setText("✦  Apply Prompt")
+        self.apply_prompt_button.setEnabled(self.paths[0] is not None)
+        self.statusBar().showMessage(f"Saved {self._revision_saved} of {self._revision_total} prompt outputs")
+        if self._revision_issues:
+            QMessageBox.warning(self, "Some prompts were not saved", "\n".join(self._revision_issues))
+
+    def _save_revision(self, job: PromptRun, revised: str) -> str | None:
+        destination = job.destination
+        if destination == self.paths[0] or (destination == self.paths[1] and not job.load_as_revised):
+            return "The output path is currently open as a document. Choose another output file."
+        if job.load_as_revised and self.dirty[1] and not self._confirm_discard(1):
+            return "Unsaved Revised edits were kept."
+        if destination.exists() and not job.overwrite_existing:
+            answer = QMessageBox.question(
+                self, "Replace output file?", f"Replace the existing file {destination}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return "The existing output file was kept."
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            from PySide6.QtCore import QSaveFile, QIODevice
+            output = QSaveFile(str(destination))
+            if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(output.errorString())
+            data = revised.encode("utf-8")
+            if output.write(data) != len(data) or not output.commit():
+                message = output.errorString()
+                output.cancelWriting()
+                raise OSError(message)
+        except OSError as exc:
+            return str(exc)
+        if job.load_as_revised:
+            self.load_file(1, destination, confirm_discard=False)
+            self.final_file_combo.setCurrentIndex(1)
+            self._set_mode(False)
+        return None
+
+    def load_file(self, side: int, path: Path, *, confirm_discard: bool = True):
+        if confirm_discard and self.dirty[side] and not self._confirm_discard(side):
             return
         try:
             text = path.read_text(encoding="utf-8")
@@ -901,6 +1025,8 @@ class MainWindow(QMainWindow):
         self._replace_editor_text(side, text)
         self._watch_path(self.paths[side])
         self._update_file_button(side)
+        if side == 0:
+            self.apply_prompt_button.setEnabled(self._revision_context is None)
         if not self._opening_pair:
             self._remember_pair()
 
@@ -1026,9 +1152,10 @@ class MainWindow(QMainWindow):
             if path and str(path) in self.watcher.files():
                 self.watcher.removePath(str(path))
         self.paths = [None, None]
+        self.apply_prompt_button.setEnabled(False)
         for side in range(2):
             self._replace_editor_text(side, "")
-        self.final_file_combo.setCurrentIndex(1)
+        self.final_file_combo.setCurrentIndex(0)
         self.current_change = -1
         self.setWindowTitle("SideXSide")
 

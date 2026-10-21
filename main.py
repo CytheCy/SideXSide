@@ -53,7 +53,7 @@ QStatusBar { background: #1e1e24; color: #9996a3; border-top: 1px solid #2d2d35;
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Native, offline Markdown prose difference viewer")
+    parser = argparse.ArgumentParser(description="Native Markdown prose difference viewer")
     parser.add_argument("original", nargs="?", help="Original Markdown file")
     parser.add_argument("revised", nargs="?", help="Revised Markdown file")
     args = parser.parse_args(argv)
